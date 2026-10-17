@@ -1,0 +1,1353 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import fontkit from '@pdf-lib/fontkit'
+import { PDFDocument, StandardFonts, rgb, degrees, type PDFPage, type PDFFont } from 'pdf-lib'
+import {
+  computeGeometry,
+  computeLayoutFromPayload,
+  mmToPt,
+  questionNumberLeftOffsetPt,
+  questionNumberImageGapPt,
+  columnIndexFromLayoutXPt,
+  FOOTER_TOP_OFFSET_MM,
+  getImageSizeFromBase64,
+  type LayoutRow,
+} from './layout-engine.js'
+import {
+  calculateQuestionDrawMetrics,
+  comparePreviewAndPdfExport,
+  logPipelineDrawTable,
+  computeColumnImageBounds,
+  logColumnOverflowIfNeeded,
+  IMG_COL_RIGHT_PAD_PT,
+  type PipelineDrawLogRow,
+} from './question-draw-metrics.js'
+import {
+  drawCenterLineText,
+  drawColumnDividers,
+  drawPageFrame,
+  drawPageHeader,
+  hexToRgbColor,
+} from './pdf-header-draw.js'
+import { drawFooterDecorativeStripesPdf } from './decorative-stripe-pdf.js'
+import {
+  isClassicTestBannerHeader,
+  isKlasikHeader,
+  isSeritHeader,
+  normalizeHeaderStyleId,
+} from './header-styles.js'
+import { SERIT_CORAL } from './serit-header-geometry.js'
+import { CLASSIC_BANNER_LINE_PT } from './pdf-description-utils.js'
+import { footerPageNumberCircleRadiusPt } from './footer-band-layout.js'
+import {
+  drawScratchGridOnPdfPage,
+  resolveScratchGridRectPt,
+  resolveScratchGridStrokeHex,
+  scratchCellPt,
+  scratchOccupiedHeightPt,
+  resolveEffectiveScratchGridRows,
+  SCRATCH_PAD_BOTTOM_PT,
+  FASIKUL_MIN_SCRATCH_ROWS,
+} from './question-scratch-grid.js'
+import { drawFasikulQuestionFrameOnPdfPage, buildFasikulOrnekNumberByOrderIndex, fasikulFrameShowsScratchGrid, fasikulFrameBadgeTopReservePt, isOptikAnswerableLayoutQuestion, resolveFasikulAnswerKeyLabel } from './fasikul-question-frame-draw.js'
+import { knockoutNearWhiteImageBase64 } from './fasikul-white-knockout.js'
+import {
+  watermarkActive,
+  watermarkAngleDeg,
+  watermarkLogoBase64,
+  watermarkOpacityPct,
+  watermarkSizePct,
+  watermarkTextValue,
+  pageNumberingEnabled,
+  formatPageNumberLabel,
+  questionNumberColorMode,
+  themePrimaryColor,
+  columnDividerColor,
+  questionNumberFontPt,
+  scratchGridCornerRadiusPt,
+  scratchGridColorMode,
+  scratchGridColorHex,
+} from './visual-properties.js'
+import { drawSeparateAnswerKeyTablePdf, SEPARATE_AK, ANSWER_KEY_NAVY_HEX, ensureSeparateAnswerKeyPages, separateAnswerKeyCapacity } from './separate-answer-key-table.js'
+
+import {
+  estimateQuestionNumberTextWidthPt,
+  maxQuestionNumberTextWidthPt,
+  questionNumberLabel,
+  QUESTION_NUM_FONT_PT,
+} from './question-number-metrics.js'
+import {
+  drawWrittenOpenEndedOnPdfPage,
+  isWrittenLayoutQuestion,
+} from './written-question-layout.js'
+/** Görsel tepe hizası: baseline = img_y_top - font_size × 0.85 (cap-height ofset) */
+const QUESTION_NUM_TOP_OFFSET_RATIO = 0.85
+
+function questionNumberBaselinePt(imgYTop: number, fontPt: number): number {
+  return imgYTop - fontPt * QUESTION_NUM_TOP_OFFSET_RATIO
+}
+
+function questionNumberLeftPt(xCol: number, offsetPt: number): number {
+  return xCol + offsetPt
+}
+
+/** css-px benzeri (önizleme) → pt */
+function pxToPtSafe(px: number): number {
+  if (!Number.isFinite(px)) return 0
+  return Math.max(0, px * 0.75)
+}
+
+const QUALITY_ZOOM: Record<string, number> = {
+  normal: 4,
+  high: 6,
+  best: 8,
+}
+
+function rawBase64(value: string) {
+  return value.includes(',') ? value.split(',')[1]! : value
+}
+
+function systemFontPaths(): {
+  regular: string
+  bold: string
+  italic?: string
+  boldItalic?: string
+} | null {
+  const candidates: Array<{
+    regular: string
+    bold: string
+    italic?: string
+    boldItalic?: string
+  }> = []
+  const win = process.env.SystemRoot ?? 'C:\\Windows'
+  candidates.push({
+    regular: path.join(win, 'Fonts', 'arial.ttf'),
+    bold: path.join(win, 'Fonts', 'arialbd.ttf'),
+    italic: path.join(win, 'Fonts', 'ariali.ttf'),
+    boldItalic: path.join(win, 'Fonts', 'arialbi.ttf'),
+  })
+  candidates.push({
+    regular: '/System/Library/Fonts/Supplemental/Arial.ttf',
+    bold: '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+    italic: '/System/Library/Fonts/Supplemental/Arial Italic.ttf',
+    boldItalic: '/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf',
+  })
+  candidates.push({
+    regular: '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    bold: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    italic: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf',
+    boldItalic: '/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf',
+  })
+  return candidates.find((p) => fs.existsSync(p.regular)) ?? null
+}
+
+async function loadPdfFonts(pdf: PDFDocument): Promise<{
+  regular: PDFFont
+  bold: PDFFont
+  italic: PDFFont
+  boldItalic: PDFFont
+}> {
+  const paths = systemFontPaths()
+  if (paths) {
+    try {
+      pdf.registerFontkit(fontkit)
+      const regular = await pdf.embedFont(fs.readFileSync(paths.regular))
+      const bold = fs.existsSync(paths.bold)
+        ? await pdf.embedFont(fs.readFileSync(paths.bold))
+        : regular
+      const italic =
+        paths.italic && fs.existsSync(paths.italic)
+          ? await pdf.embedFont(fs.readFileSync(paths.italic))
+          : regular
+      const boldItalic =
+        paths.boldItalic && fs.existsSync(paths.boldItalic)
+          ? await pdf.embedFont(fs.readFileSync(paths.boldItalic))
+          : bold
+      return { regular, bold, italic, boldItalic }
+    } catch {
+      /* fallback */
+    }
+  }
+  const regular = await pdf.embedFont(StandardFonts.Helvetica)
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold)
+  const italic = await pdf.embedFont(StandardFonts.HelveticaOblique)
+  const boldItalic = await pdf.embedFont(StandardFonts.HelveticaBoldOblique)
+  return { regular, bold, italic, boldItalic }
+}
+
+async function embedQuestionImage(pdf: PDFDocument, b64: string) {
+  const bytes = Buffer.from(rawBase64(b64), 'base64')
+  // Knockout sonrası her zaman PNG (alfa / yeniden boyama)
+  try {
+    return await pdf.embedPng(bytes)
+  } catch {
+    try {
+      return await pdf.embedJpg(bytes)
+    } catch {
+      // son çare: data-url bozulmuş olabilir
+      return await pdf.embedPng(bytes)
+    }
+  }
+}
+
+function drawFooter(
+  page: PDFPage,
+  payload: Record<string, unknown>,
+  geom: ReturnType<typeof computeGeometry>,
+  pageNum: number,
+  pageItems: LayoutRow[],
+  fonts: { regular: PDFFont; bold: PDFFont; italic?: PDFFont },
+  totalPages: number,
+) {
+  const theme = hexToRgbColor(themePrimaryColor(payload))
+  const written = Boolean(payload.written_paper_header)
+  const stroke = written ? rgb(0, 0, 0) : theme
+  const footerTop = geom.contentBottom
+  const footerBottom = geom.footerBottom
+
+  if (written) {
+    page.drawLine({
+      start: { x: geom.ml, y: footerTop },
+      end: { x: geom.page_w_pt - geom.mr, y: footerTop },
+      thickness: 0.9,
+      color: stroke,
+    })
+  } else {
+    const styleId = normalizeHeaderStyleId(String(payload.header_style_id ?? ''))
+    const classicFooter =
+      isClassicTestBannerHeader(styleId) ||
+      isSeritHeader(styleId) ||
+      isKlasikHeader(styleId)
+    if (classicFooter) {
+      // Yaprak Test: mercan üst+alt; Klasik/diğer: tema primary üst+alt
+      const bannerStroke = hexToRgbColor(
+        isSeritHeader(styleId) ? SERIT_CORAL : themePrimaryColor(payload),
+      )
+      const thickness = isKlasikHeader(styleId) ? 0.8 : CLASSIC_BANNER_LINE_PT
+      page.drawLine({
+        start: { x: geom.ml, y: footerTop },
+        end: { x: geom.page_w_pt - geom.mr, y: footerTop },
+        thickness,
+        color: bannerStroke,
+      })
+      page.drawLine({
+        start: { x: geom.ml, y: footerBottom },
+        end: { x: geom.page_w_pt - geom.mr, y: footerBottom },
+        thickness,
+        color: bannerStroke,
+      })
+    } else {
+      drawFooterDecorativeStripesPdf(page, payload, geom, footerTop, footerBottom)
+    }
+  }
+
+  const includeAnswerKey = Boolean(payload.include_answer_key)
+  const answerKeyMode = String(payload.answer_key_mode ?? 'per_page')
+  if (includeAnswerKey && answerKeyMode === 'per_page' && pageItems.length > 0) {
+    const cols = Math.max(1, geom.columnX.length)
+    const buckets: string[][] = Array.from({ length: cols }, () => [])
+    pageItems
+      .filter((i) => i.display_number != null)
+      .sort((a, b) => (a.display_number as number) - (b.display_number as number))
+      .forEach((i) => {
+        const col = columnIndexFromLayoutXPt(i.x_pt, geom.columnX)
+        buckets[col]?.push(`${i.display_number}- ${i.answer_key || '?'}`)
+      })
+    const yAns = written ? footerTop - 3 : (footerTop + footerBottom) / 2 - 3
+    const akStyleId = normalizeHeaderStyleId(String(payload.header_style_id ?? ''))
+    const akColor = written
+      ? rgb(0, 0, 0)
+      : isSeritHeader(akStyleId)
+        ? hexToRgbColor(SERIT_CORAL)
+        : isKlasikHeader(akStyleId)
+          ? theme
+          : hexToRgbColor(ANSWER_KEY_NAVY_HEX)
+    for (let col = 0; col < cols; col++) {
+      const ans = buckets[col]?.join('  ') ?? ''
+      if (!ans) continue
+      const colLeft = geom.columnX[col]!
+      const colRight = colLeft + geom.colW
+      const textW = fonts.bold.widthOfTextAtSize(ans, 9)
+      let x = colLeft
+      if (cols > 1 && col === cols - 1) {
+        x = colRight - textW
+      } else if (cols > 1 && col > 0 && col < cols - 1) {
+        x = colLeft + (geom.colW - textW) / 2
+      }
+      page.drawText(ans, {
+        x,
+        y: yAns,
+        size: 9,
+        font: fonts.bold,
+        color: akColor,
+      })
+    }
+  }
+
+  if (!written && pageNumberingEnabled(payload)) {
+    const pg = formatPageNumberLabel(pageNum, totalPages, payload)
+    const styleId = normalizeHeaderStyleId(String(payload.header_style_id ?? ''))
+    const circleR = footerPageNumberCircleRadiusPt(footerTop, footerBottom, styleId)
+    const cx = geom.ml + (geom.page_w_pt - geom.ml - geom.mr) / 2
+    const cy = (footerTop + footerBottom) / 2
+    const pageNumColor = hexToRgbColor(
+      isSeritHeader(styleId) ? SERIT_CORAL : themePrimaryColor(payload),
+    )
+    page.drawCircle({
+      x: cx,
+      y: cy,
+      size: circleR,
+      color: pageNumColor,
+      borderColor: pageNumColor,
+      borderWidth: 0.5,
+    })
+    const chord = circleR * 2 * 0.72
+    let fs = Math.min(10, circleR * 0.95)
+    while (fs >= 5 && fonts.bold.widthOfTextAtSize(pg, fs) > chord) fs -= 0.5
+    const pgW = fonts.bold.widthOfTextAtSize(pg, fs)
+    page.drawText(pg, {
+      x: cx - pgW / 2,
+      y: cy - fs * 0.35,
+      size: fs,
+      font: fonts.bold,
+      color: rgb(1, 1, 1),
+    })
+  }
+
+  // Deneme: sağ alt navigasyon yazıları (Test modülünde yok)
+  if (
+    !written &&
+    payload.show_footer_nav_hints === true
+  ) {
+    const lastQ = Math.max(0, Number(payload.last_question_page ?? 0))
+    if (lastQ > 0 && pageNum >= 1 && pageNum <= lastQ) {
+      const rightX = geom.page_w_pt - geom.mr
+      const cy = (footerTop + footerBottom) / 2
+      const bandH = Math.max(8, footerTop - footerBottom)
+      const endFont = Math.min(8.5, Math.max(6, bandH * 0.28))
+      const italic = fonts.italic ?? fonts.regular
+      const color = rgb(0.067, 0.094, 0.153) // #111827
+      if (pageNum === lastQ) {
+        const gap = endFont * 0.35
+        const line1 = 'TEST BİTTİ.'
+        const line2 = 'CEVAPLARINIZI KONTROL EDİNİZ.'
+        const w1 = italic.widthOfTextAtSize(line1, endFont)
+        const w2 = italic.widthOfTextAtSize(line2, endFont)
+        page.drawText(line1, {
+          x: rightX - w1,
+          y: cy + endFont * 0.55 + gap / 2 - endFont * 0.35,
+          size: endFont,
+          font: italic,
+          color,
+        })
+        page.drawText(line2, {
+          x: rightX - w2,
+          y: cy - endFont * 0.55 - gap / 2 - endFont * 0.35,
+          size: endFont,
+          font: italic,
+          color,
+        })
+      } else {
+        const line = 'Diğer sayfaya geçiniz.'
+        const w = italic.widthOfTextAtSize(line, endFont)
+        page.drawText(line, {
+          x: rightX - w,
+          y: cy - endFont * 0.35,
+          size: endFont,
+          font: italic,
+          color,
+        })
+      }
+    }
+  }
+}
+
+async function drawWatermark(
+  pdf: PDFDocument,
+  page: PDFPage,
+  payload: Record<string, unknown>,
+  geom: ReturnType<typeof computeGeometry>,
+  fonts: { regular: PDFFont; bold: PDFFont },
+) {
+  if (!watermarkActive(payload)) return
+  const opacity = Math.max(0.01, Math.min(1, watermarkOpacityPct(payload) / 100))
+  const sizeFactor = Math.max(0.1, Math.min(1, watermarkSizePct(payload) / 100))
+  const logoB64 = watermarkLogoBase64(payload)
+  const cx = geom.page_w_pt / 2
+  const cy = geom.page_h_pt / 2
+
+  if (logoB64) {
+    try {
+      const image = await embedQuestionImage(pdf, logoB64)
+      const targetW = geom.page_w_pt * 0.7 * sizeFactor
+      const targetH = (image.height / image.width) * targetW
+      page.drawImage(image, {
+        x: cx - targetW / 2,
+        y: cy - targetH / 2,
+        width: targetW,
+        height: targetH,
+        opacity,
+      })
+    } catch {
+      /* logo gömülemedi */
+    }
+    return
+  }
+
+  const text = watermarkTextValue(payload)
+  if (!text) return
+  const base = Math.min(geom.page_w_pt, geom.page_h_pt) * 0.12
+  const fontSize = Math.max(10, base * sizeFactor)
+  const color = hexToRgbColor(String(payload.watermark_text_color ?? payload.theme_color ?? '#1E88E5'))
+  const font = fonts.bold
+  const tw = font.widthOfTextAtSize(text.slice(0, 80), fontSize)
+  const angleDeg = watermarkAngleDeg(payload)
+  const rad = (angleDeg * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  const rcx = tw / 2
+  const rcy = fontSize * 0.35
+
+  page.drawText(text.slice(0, 80), {
+    x: cx - rcx * cos + rcy * sin,
+    y: cy - rcx * sin - rcy * cos,
+    size: fontSize,
+    font,
+    color,
+    opacity,
+    rotate: degrees(angleDeg),
+  })
+}
+
+function collectAnswerKeyItems(
+  layout: LayoutRow[],
+  payload: Record<string, unknown>,
+): Array<{ label: string; num: number; answer: string }> {
+  const questions = (payload.questions as Array<Record<string, unknown>>) ?? []
+  const useFasikulLabels = Boolean(payload.fasikul_answer_key_labels)
+  const qByOrder = new Map(
+    questions.map((q) => [Number(q.order_index ?? -1), q] as const),
+  )
+  const ornekByOrder = useFasikulLabels
+    ? buildFasikulOrnekNumberByOrderIndex(questions)
+    : new Map<number, number>()
+
+  return layout
+    .filter((l) => l.kind !== 'answer_key_page' && l.display_number != null)
+    .sort((a, b) => (a.display_number as number) - (b.display_number as number))
+    .flatMap((l) => {
+      const q = qByOrder.get(l.order_index)
+      if (useFasikulLabels && q && !isOptikAnswerableLayoutQuestion(q)) {
+        return []
+      }
+      const num = l.display_number as number
+      const ansFromLayout = String(l.answer_key || '').trim().toUpperCase()
+      const ansFromQ = q ? String(q.answer_key ?? '').trim().toUpperCase() : ''
+      const answer =
+        (ansFromLayout && ansFromLayout !== '?' ? ansFromLayout : '') ||
+        ansFromQ ||
+        '?'
+      const label =
+        useFasikulLabels && q
+          ? resolveFasikulAnswerKeyLabel(q, ornekByOrder, num)
+          : String(num)
+      return [{ num, label, answer }]
+    })
+}
+
+function drawAnswerKeyPage(
+  page: PDFPage,
+  layout: LayoutRow[],
+  geom: ReturnType<typeof computeGeometry>,
+  fonts: { regular: PDFFont; bold: PDFFont },
+  payload: Record<string, unknown>,
+  pageNum: number,
+) {
+  const mt = mmToPt(Number(payload.margin_top_mm ?? 10))
+  const mb = mmToPt(Number(payload.margin_bottom_mm ?? 10))
+  const yTop = geom.page_h_pt - mt - SEPARATE_AK.TOP_GAP_PT
+  const contentW = geom.page_w_pt - geom.ml - geom.mr
+  const footerTop = mb + mmToPt(FOOTER_TOP_OFFSET_MM)
+  const availableHPt = Math.max(0, yTop - (footerTop + mmToPt(2)))
+  const useFasikulLabels = Boolean(payload.fasikul_answer_key_labels)
+  const pairsPerRow = useFasikulLabels ? 4 : SEPARATE_AK.PAIRS_PER_ROW
+  const { capacity } = separateAnswerKeyCapacity({
+    availableHeightPt: availableHPt,
+    pairsPerRow,
+  })
+  const entriesPerPage = Math.max(pairsPerRow, capacity)
+
+  const keyed = collectAnswerKeyItems(layout, payload)
+  const akPageNums = [
+    ...new Set(
+      layout.filter((l) => l.kind === 'answer_key_page').map((l) => l.page_num),
+    ),
+  ].sort((a, b) => a - b)
+  const pageIdx = Math.max(0, akPageNums.indexOf(pageNum))
+  const chunk = keyed.slice(pageIdx * entriesPerPage, pageIdx * entriesPerPage + entriesPerPage)
+  if (chunk.length === 0) return
+
+  drawSeparateAnswerKeyTablePdf({
+    page,
+    x: geom.ml,
+    yTop,
+    width: contentW,
+    items: chunk,
+    fonts,
+    title: 'Cevap Anahtarı',
+    pairsPerRow,
+  })
+}
+
+function buildDrawLayoutContext(payload: Record<string, unknown>): {
+  singleAvailWPt: number
+  fullWidthAvailWPt: number
+  allowSlightOverflow: boolean
+} {
+  const geom = computeGeometry(payload, 1)
+  const questions = (payload.questions as Array<Record<string, unknown>>) ?? []
+  const questionCount = questions.filter(
+    (q) => String(q.content_type ?? 'question') !== 'explanation',
+  ).length
+  const startNum = Math.max(1, Number(payload.question_number_start ?? 1))
+  const fontPt = questionNumberFontPt(payload)
+  const maxDisplayNum = startNum + Math.max(0, questionCount - 1)
+  const maxNumTextWPt = maxQuestionNumberTextWidthPt(Math.max(1, maxDisplayNum), fontPt)
+  const numImageGapPt = questionNumberImageGapPt(payload)
+  const numOffsetPt = Math.max(0, questionNumberLeftOffsetPt(payload))
+  const singleAvailWPt =
+    geom.colW - maxNumTextWPt - numImageGapPt - IMG_COL_RIGHT_PAD_PT - numOffsetPt
+  const fullWidthHorizontalPadding =
+    maxNumTextWPt + numImageGapPt + IMG_COL_RIGHT_PAD_PT + numOffsetPt
+  const fullWidthAvailWPt = Math.max(
+    1,
+    geom.page_w_pt - geom.ml - geom.mr - fullWidthHorizontalPadding,
+  )
+  return {
+    singleAvailWPt,
+    fullWidthAvailWPt,
+    allowSlightOverflow: payload.allow_slight_overflow === true,
+  }
+}
+
+/** pdf-lib drawSvgPath: y = şeklin ÜST kenarı */
+function sectionRoundRectPath(w: number, h: number, r: number): string {
+  const rad = Math.min(r, w / 2, h / 2)
+  return [
+    `M ${rad},0`,
+    `L ${w - rad},0`,
+    `Q ${w},0 ${w},${rad}`,
+    `L ${w},${h - rad}`,
+    `Q ${w},${h} ${w - rad},${h}`,
+    `L ${rad},${h}`,
+    `Q 0,${h} 0,${h - rad}`,
+    `L 0,${rad}`,
+    `Q 0,0 ${rad},0`,
+    'Z',
+  ].join(' ')
+}
+
+function drawSectionHeaderOnPdfPage(
+  page: PDFPage,
+  item: LayoutRow,
+  font: PDFFont,
+): void {
+  const sec = item.section
+  if (!sec) return
+  const boxH = Math.max(8, Number(sec.box_h) || 22)
+  const width = Math.max(1, Number(item.w_pt) || 0)
+  if (!(width > 0)) return
+  const yTop = Number(item.y_top_pt)
+  if (!Number.isFinite(yTop)) return
+  const title = String(sec.title || 'Bölüm').slice(0, 40)
+  const fontPt = Math.max(6, Number(sec.font_pt) || 12)
+  const radius = Math.min(6, width / 2, boxH / 2)
+
+  page.drawSvgPath(sectionRoundRectPath(width, boxH, radius), {
+    x: item.x_pt,
+    y: yTop,
+    color: hexToRgbColor(String(sec.fill_color || '#F34A2F')),
+    ...(isSectionLineColorEnabled(sec.line_color)
+      ? {
+          borderColor: hexToRgbColor(String(sec.line_color)),
+          borderWidth: 0.8,
+        }
+      : {}),
+  })
+
+  const textW = font.widthOfTextAtSize(title, fontPt)
+  page.drawText(title, {
+    x: item.x_pt + Math.max(0, (width - textW) / 2),
+    y: yTop - boxH / 2 - fontPt * 0.35,
+    size: fontPt,
+    font,
+    color: hexToRgbColor(String(sec.text_color || '#FFFFFF')),
+  })
+}
+
+function isSectionLineColorEnabled(lineColor?: string | null): boolean {
+  const t = String(lineColor || '').trim().toLowerCase()
+  if (!t || t === 'none' || t === 'transparent' || t === 'off') return false
+  return /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(t)
+}
+
+function parseLockedSectionMeta(
+  raw: unknown,
+): LayoutRow['section'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const s = raw as Record<string, unknown>
+  const boxRaw = Number(s.box_h)
+  const gapRaw = Number(s.gap_after)
+  const fontRaw = Number(s.font_pt)
+  return {
+    title: String(s.title ?? 'Bölüm').trim() || 'Bölüm',
+    fill_color: String(s.fill_color ?? '#F34A2F'),
+    text_color: String(s.text_color ?? '#FFFFFF'),
+    line_color: String(s.line_color ?? 'none'),
+    font_pt: Number.isFinite(fontRaw) && fontRaw > 0 ? fontRaw : 12,
+    box_h: Number.isFinite(boxRaw) && boxRaw > 0 ? boxRaw : 22,
+    gap_after: Number.isFinite(gapRaw) && gapRaw >= 0 ? gapRaw : 6,
+    start_new_page: s.start_new_page === true,
+    restart_numbering: s.restart_numbering === true,
+  }
+}
+
+function sectionMetaFromPayloadForOrder(
+  payload: Record<string, unknown>,
+  orderIndex: number,
+  lockedSection: unknown,
+): LayoutRow['section'] | undefined {
+  const fromLocked = parseLockedSectionMeta(lockedSection)
+  if (fromLocked) return fromLocked
+  const raw = payload.sections
+  if (!Array.isArray(raw)) return undefined
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const s = entry as Record<string, unknown>
+    if (Number(s.start_idx) !== orderIndex) continue
+    return parseLockedSectionMeta({
+      ...s,
+      box_h: 22,
+      gap_after: 6,
+    })
+  }
+  return undefined
+}
+
+async function drawQuestionsOnPage(
+  pdf: PDFDocument,
+  page: PDFPage,
+  pageItems: LayoutRow[],
+  fonts: { bold: PDFFont; regular?: PDFFont },
+  payload: Record<string, unknown>,
+  layoutCtx: {
+    singleAvailWPt: number
+    fullWidthAvailWPt: number
+    allowSlightOverflow?: boolean
+  },
+  pdfLogRows: PipelineDrawLogRow[],
+  counters: {
+    renderedQuestionCount: number
+    usedSharedMetricsCount: number
+    usedLockedLayoutCount: number
+    drawImageLogCount: number
+  },
+  exportId: string,
+  usedLockedLayoutPositions: boolean,
+) {
+  const numOffsetPt = questionNumberLeftOffsetPt(payload)
+  const numImageGapPt = questionNumberImageGapPt(payload)
+  const numFontPt = questionNumberFontPt(payload)
+  const styleIdForNum = normalizeHeaderStyleId(String(payload.header_style_id ?? ''))
+  const numColor =
+    questionNumberColorMode(payload) === 'black'
+      ? rgb(0, 0, 0)
+      : hexToRgbColor(
+          isSeritHeader(styleIdForNum) ? SERIT_CORAL : themePrimaryColor(payload),
+        )
+
+  const questions = (payload.questions as Array<Record<string, unknown>>) ?? []
+  const qByOrder = new Map(questions.map((q) => [Number(q.order_index ?? -1), q]))
+  const ornekNumberByOrder = buildFasikulOrnekNumberByOrderIndex(questions)
+  const geom = computeGeometry(payload, 1)
+  const colW = geom.colW
+  const showScratch = payload.show_question_scratch_grid === true
+  const scratchCornerRadiusPt = scratchGridCornerRadiusPt(payload)
+  const scratchStrokeHex = resolveScratchGridStrokeHex({
+    colorMode: scratchGridColorMode(payload),
+    customColor: scratchGridColorHex(payload),
+    themeColor: themePrimaryColor(payload),
+  })
+
+  for (const item of pageItems) {
+    drawSectionHeaderOnPdfPage(page, item, fonts.bold)
+
+    const qEarly = qByOrder.get(item.order_index)
+    const isWrittenQ = qEarly ? isWrittenLayoutQuestion(qEarly as Record<string, unknown>) : false
+    const frameEnabled =
+      showScratch &&
+      Boolean(
+        qEarly &&
+          typeof qEarly === 'object' &&
+          (qEarly as { fasikulFrame?: { enabled?: boolean } }).fasikulFrame?.enabled,
+      )
+    if (
+      !isWrittenQ &&
+      !frameEnabled &&
+      item.display_number != null &&
+      item.img_y_top_pt != null
+    ) {
+      const numText = questionNumberLabel(item.display_number)
+      page.drawText(numText, {
+        x: questionNumberLeftPt(item.x_pt, numOffsetPt),
+        y: questionNumberBaselinePt(item.img_y_top_pt, numFontPt),
+        size: numFontPt,
+        font: fonts.bold,
+        color: numColor,
+      })
+    }
+
+    const emptyRows = Number(
+      qEarly && typeof qEarly === 'object'
+        ? (qEarly as { fasikulEmptyRows?: unknown }).fasikulEmptyRows ?? 0
+        : 0,
+    )
+    const isEmptyFasikulBox = emptyRows > 0 && frameEnabled
+
+    if (isWrittenQ && qEarly) {
+      const drawW = item.img_w_pt ?? item.w_pt ?? 0
+      const drawH = item.img_h_pt ?? item.h_pt ?? 0
+      const layoutImgTop = item.img_y_top_pt ?? item.y_top_pt ?? 0
+      const numTextW =
+        item.display_number != null
+          ? fonts.bold.widthOfTextAtSize(
+              questionNumberLabel(item.display_number),
+              numFontPt,
+            )
+          : estimateQuestionNumberTextWidthPt(item.display_number, numFontPt)
+      const x = item.img_x_pt ?? item.x_pt + numOffsetPt + numTextW + numImageGapPt
+      if (drawW > 0 && drawH > 0) {
+        const accent =
+          typeof (payload as { written_accent_color?: unknown }).written_accent_color === 'string'
+            ? String((payload as { written_accent_color?: string }).written_accent_color)
+            : themePrimaryColor(payload) || '#0D9488'
+        drawWrittenOpenEndedOnPdfPage(page, {
+          x,
+          yTop: layoutImgTop,
+          w: drawW,
+          h: drawH,
+          displayNumber: item.display_number ?? item.order_index + 1,
+          stemHtml: String((qEarly as { writtenStemHtml?: string }).writtenStemHtml ?? ''),
+          answerArea: String((qEarly as { writtenAnswerArea?: string }).writtenAnswerArea ?? 'lines'),
+          answerLines: Number((qEarly as { writtenAnswerLines?: number }).writtenAnswerLines ?? 5),
+          accentHex: accent,
+          font: fonts.regular ?? fonts.bold,
+          fontBold: fonts.bold,
+          rgb,
+        })
+        counters.renderedQuestionCount += 1
+      }
+      continue
+    }
+
+    if (isEmptyFasikulBox) {
+      const frameRaw =
+        qEarly && typeof qEarly === 'object'
+          ? (qEarly as { fasikulFrame?: Record<string, unknown> }).fasikulFrame
+          : undefined
+      const drawW = item.img_w_pt ?? item.w_pt ?? 0
+      const drawH = item.img_h_pt ?? item.h_pt ?? 0
+      if (!(drawW > 0) || !(drawH > 0) || !frameRaw) continue
+      const numTextW =
+        item.display_number != null
+          ? fonts.bold.widthOfTextAtSize(
+              questionNumberLabel(item.display_number),
+              numFontPt,
+            )
+          : estimateQuestionNumberTextWidthPt(item.display_number, numFontPt)
+      const x = item.x_pt + numOffsetPt + numTextW + numImageGapPt
+      const layoutImgTop = item.img_y_top_pt ?? 0
+      const y = layoutImgTop - drawH
+      const colRightPt = item.x_pt + item.w_pt
+      const frameW = Math.max(drawW, Math.max(0, colRightPt - x))
+      drawFasikulQuestionFrameOnPdfPage(page, {
+        x,
+        yBottom: y,
+        width: frameW,
+        height: drawH,
+        frame: frameRaw,
+        font: fonts.bold,
+        questionNumber: ornekNumberByOrder.get(item.order_index) ?? null,
+      })
+      counters.renderedQuestionCount += 1
+      continue
+    }
+
+    if (!item.image_base64) continue
+
+    try {
+      const q = qEarly
+      const frameRaw =
+        q && typeof q === 'object'
+          ? (q as { fasikulFrame?: Record<string, unknown> }).fasikulFrame
+          : undefined
+      const frameEnabledNow =
+        showScratch && Boolean(frameRaw && frameRaw.enabled === true)
+      const borderStyle = String(frameRaw?.borderStyle ?? 'solid')
+      const fillOpacityPct = Number(frameRaw?.fillOpacityPct ?? 100)
+      const frameVisibleBox =
+        frameEnabledNow &&
+        (borderStyle !== 'none' || (Number.isFinite(fillOpacityPct) && fillOpacityPct > 0))
+      const fillHex =
+        frameVisibleBox && typeof frameRaw?.fillColor === 'string'
+          ? String(frameRaw.fillColor)
+          : undefined
+      const sourceB64 = frameVisibleBox
+        ? knockoutNearWhiteImageBase64(item.image_base64, {
+            fillHex,
+            threshold: 242,
+          })
+        : item.image_base64
+      const image = await embedQuestionImage(pdf, sourceB64)
+      // Önizleme ile aynı: çerçeve numarayı gizler ama numara yuvasını korur.
+      const numTextW =
+        item.display_number != null
+          ? fonts.bold.widthOfTextAtSize(
+              questionNumberLabel(item.display_number),
+              numFontPt,
+            )
+          : estimateQuestionNumberTextWidthPt(item.display_number, numFontPt)
+
+      const size = getImageSizeFromBase64(item.image_base64)
+      const metrics =
+        q && size ? calculateQuestionDrawMetrics(q, layoutCtx, size) : null
+
+      let drawW: number
+      let drawH: number
+      let usedShared = false
+      /** Önizleme ile birebir: kilitli layout’ta çizim boyutu da img_* olsun */
+      if (
+        usedLockedLayoutPositions &&
+        item.img_w_pt != null &&
+        item.img_h_pt != null &&
+        item.img_w_pt > 0 &&
+        item.img_h_pt > 0
+      ) {
+        drawW = item.img_w_pt
+        drawH = item.img_h_pt
+        counters.usedLockedLayoutCount += 1
+      } else if (metrics) {
+        drawW = metrics.drawWidth
+        drawH = metrics.drawHeight
+        usedShared = true
+        counters.usedSharedMetricsCount += 1
+      } else {
+        drawW = item.img_w_pt ?? 0
+        drawH = item.img_h_pt ?? 0
+        counters.usedLockedLayoutCount += 1
+      }
+
+      const x = item.x_pt + numOffsetPt + numTextW + numImageGapPt
+      const layoutImgTop = item.img_y_top_pt ?? 0
+      const drawImgTop = layoutImgTop
+      const y = drawImgTop - drawH
+      const questionNo = item.display_number ?? item.order_index + 1
+      counters.renderedQuestionCount += 1
+
+      const bounds = computeColumnImageBounds({
+        columnXPt: item.x_pt,
+        columnContentWidthPt: item.span_full_width ? geom.page_w_pt - geom.ml - geom.mr : colW,
+        rightPaddingPt: IMG_COL_RIGHT_PAD_PT,
+        imageXPt: x,
+        drawWidthPt: drawW,
+      })
+      logColumnOverflowIfNeeded(bounds, questionNo, 'PDF_EXPORT')
+
+      if (metrics) {
+        pdfLogRows.push({
+          pipeline: 'PDF_EXPORT',
+          questionNo,
+          normalizationScale: metrics.normalizationScale,
+          manualScale: metrics.manualScale,
+          requestedScale: metrics.requestedScale,
+          nativeWidthPt: metrics.nativeWidthPt,
+          widthLimit: metrics.widthLimit,
+          appliedScale: metrics.appliedScale,
+          drawWidth: drawW,
+          drawHeight: drawH,
+          x,
+          y,
+          metadataSource: metrics.metadataSource,
+          fulfillment: metrics.fulfillment,
+          limitation: metrics.limitation,
+          columnLeftPt: bounds.columnLeftPt,
+          columnRightPt: bounds.columnRightPt,
+          imageXPt: bounds.imageXPt,
+          safeRightPt: bounds.safeRightPt,
+          drawRightPt: bounds.drawRightPt,
+          overflowPt: bounds.overflowPt,
+          columnBoundsValid: bounds.columnBoundsValid,
+        })
+      }
+
+      console.debug('[PDF_EXPORT:DRAW_IMAGE]', {
+        exportId,
+        questionNo,
+        requestedScale: metrics?.requestedScale ?? null,
+        appliedScale: metrics?.appliedScale ?? null,
+        normalizationScale: metrics?.normalizationScale ?? null,
+        manualScale: metrics?.manualScale ?? null,
+        drawWidth: drawW,
+        drawHeight: drawH,
+        lockedWidth: item.img_w_pt ?? null,
+        lockedHeight: item.img_h_pt ?? null,
+        usedLockedLayout: !usedShared,
+        usedLockedLayoutPositions,
+        usedSharedMetrics: usedShared,
+        columnLeftPt: bounds.columnLeftPt,
+        columnRightPt: bounds.columnRightPt,
+        imageXPt: bounds.imageXPt,
+        safeRightPt: bounds.safeRightPt,
+        drawRightPt: bounds.drawRightPt,
+        overflowPt: bounds.overflowPt,
+        columnBoundsValid: bounds.columnBoundsValid,
+        file: 'electron/services/pdf-export-renderer.ts',
+        fn: 'drawQuestionsOnPage',
+      })
+      counters.drawImageLogCount += 1
+
+      const innerPadPt = frameVisibleBox
+        ? Math.max(
+            0,
+            Math.min(
+              drawW / 3,
+              drawH / 3,
+              pxToPtSafe(Number(frameRaw?.innerPaddingPx) || 0),
+            ),
+          )
+        : 0
+      const colRightPt = item.x_pt + item.w_pt
+      const frameW = frameEnabledNow
+        ? Math.max(drawW, Math.max(0, colRightPt - x))
+        : drawW
+
+      const frameArgs = {
+        x,
+        yBottom: y,
+        width: frameW,
+        height: drawH,
+        frame: frameRaw as import('./fasikul-question-frame-draw.js').FasikulFramePdfSettings,
+        font: fonts.bold,
+        questionNumber: ornekNumberByOrder.get(item.order_index) ?? null,
+      }
+
+      // Önizleme ile aynı katman: dolgu → görsel → kenarlık+rozet
+      if (frameEnabledNow && frameRaw) {
+        drawFasikulQuestionFrameOnPdfPage(page, { ...frameArgs, layers: 'fill' })
+      }
+
+      page.drawImage(image, {
+        x: x + innerPadPt,
+        y: y + innerPadPt,
+        width: Math.max(1, drawW - innerPadPt * 2),
+        height: Math.max(1, drawH - innerPadPt * 2),
+      })
+
+      if (frameEnabledNow && frameRaw) {
+        drawFasikulQuestionFrameOnPdfPage(page, { ...frameArgs, layers: 'chrome' })
+      }
+    } catch (err) {
+      console.debug('[PDF_EXPORT:DRAW_IMAGE] FAILED', {
+        exportId,
+        order_index: item.order_index,
+        err: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  if (showScratch) {
+    const midX = geom.page_w_pt / 2
+    const footerTopPt = geom.contentBottom
+    for (const item of pageItems) {
+      if (
+        item.img_x_pt == null ||
+        item.img_y_top_pt == null ||
+        item.img_w_pt == null ||
+        item.img_h_pt == null
+      ) {
+        continue
+      }
+      const currBottomPt = item.img_y_top_pt - item.img_h_pt
+      const fullWidth = item.span_full_width === true || item.layout_mode === 'full-width'
+      const isLeft = item.img_x_pt < midX
+      const below = pageItems.filter(
+        (l) =>
+          l.img_x_pt != null &&
+          l.img_y_top_pt != null &&
+          (fullWidth || l.img_x_pt < midX === isLeft) &&
+          (l.img_y_top_pt ?? 0) < (item.img_y_top_pt ?? 0),
+      )
+      const next = below.sort((a, b) => (b.img_y_top_pt ?? 0) - (a.img_y_top_pt ?? 0))[0]
+      // Blok üstü (y_top) = ÖRNEK badge üstü; img_y_top badge alanını keser
+      const gapBottomPt = next
+        ? (next.y_top_pt ?? next.img_y_top_pt ?? footerTopPt)
+        : footerTopPt
+      // Soru görseli / çerçeve ile aynı sol kenar (numara yuvası dahil)
+      const numTextW =
+        item.display_number != null
+          ? fonts.bold.widthOfTextAtSize(
+              questionNumberLabel(item.display_number),
+              numFontPt,
+            )
+          : estimateQuestionNumberTextWidthPt(item.display_number, numFontPt)
+      const questionLeftPt = item.x_pt + numOffsetPt + numTextW + numImageGapPt
+      const colRightPt = item.x_pt + item.w_pt
+      const padBottomPt = SCRATCH_PAD_BOTTOM_PT
+      const qScratch = qByOrder.get(item.order_index) as
+        | { scratchGridRows?: number; fasikulFrame?: unknown }
+        | undefined
+      if (!fasikulFrameShowsScratchGrid(qScratch?.fasikulFrame)) continue
+      const grid = resolveScratchGridRectPt({
+        xPt: questionLeftPt,
+        widthPt: Math.max(0, colRightPt - questionLeftPt),
+        questionBottomPt: currBottomPt,
+        gapBottomPt,
+        padBottomPt,
+        rowsOverride: qScratch?.scratchGridRows,
+        minRows: FASIKUL_MIN_SCRATCH_ROWS,
+      })
+      if (grid)
+        drawScratchGridOnPdfPage(page, grid, {
+          cornerRadiusPt: scratchCornerRadiusPt,
+          strokeHex: scratchStrokeHex,
+        })
+    }
+  }
+}
+
+export type PdfExportDiagnostics = {
+  exportId: string
+  renderedQuestionCount: number
+  pdfExportDiagnosticsCount: number
+  usedSharedMetricsCount: number
+  usedLockedLayoutCount: number
+  usedLockedLayoutPositions: boolean
+  drawImageLogCount: number
+  questions: Array<{
+    questionNo: number
+    requestedScale: number
+    appliedScale: number
+    drawWidth: number
+    drawHeight: number
+    normalizationScale: number
+    manualScale: number
+    metadataSource: string
+  }>
+  rendererFile: string
+}
+
+/** Önizleme ile aynı layout + CanvasPdfPreview header/footer */
+export async function exportPdfFromPayload(
+  payload: Record<string, unknown>,
+): Promise<{ bytes: Uint8Array; diagnostics: PdfExportDiagnostics }> {
+  void (QUALITY_ZOOM[String(payload.quality ?? 'high')] ?? 6)
+
+  const exportId = String(payload.exportId ?? `exp_${Date.now()}`)
+  console.debug('[PDF_EXPORT:RENDERER]', {
+    exportId,
+    file: 'electron/services/pdf-export-renderer.ts',
+    fn: 'exportPdfFromPayload',
+  })
+
+  const layoutCtx = buildDrawLayoutContext(payload)
+  const pdfLogRows: PipelineDrawLogRow[] = []
+  const counters = {
+    renderedQuestionCount: 0,
+    usedSharedMetricsCount: 0,
+    usedLockedLayoutCount: 0,
+    drawImageLogCount: 0,
+  }
+
+  const geom0 = computeGeometry(payload, 1)
+  const page_w_pt = geom0.page_w_pt
+  const page_h_pt = geom0.page_h_pt
+
+  const locked = payload.locked_layout
+  let layout: LayoutRow[]
+  let usedLockedLayoutPositions = false
+  const hasSections =
+    Array.isArray(payload.sections) && (payload.sections as unknown[]).length > 0
+  // Bölüm varken kilitli önizleme rezervi ezilmiş olabiliyor — motor yeniden hesaplasın
+  if (!hasSections && Array.isArray(locked) && locked.length > 0) {
+    usedLockedLayoutPositions = true
+    console.debug('[PDF_EXPORT:RENDERER] locked_layout positions', {
+      exportId,
+      lockedRows: locked.length,
+      note: 'draw W/H from locked img_w_pt/img_h_pt (preview parity)',
+    })
+    const questions = (payload.questions as Array<Record<string, unknown>>) ?? []
+    const fasikulMode = payload.show_question_scratch_grid === true
+    const imgByOrder = new Map<number, string>()
+    const emptyOrders = new Set<number>()
+    for (const q of questions) {
+      const oi = Number(q.order_index ?? -1)
+      if (Number((q as { fasikulEmptyRows?: unknown }).fasikulEmptyRows ?? 0) > 0) {
+        emptyOrders.add(oi)
+        continue
+      }
+      const b64 = q.image_base64 as string | undefined
+      if (!b64) continue
+      imgByOrder.set(oi, b64)
+    }
+    layout = locked.map((raw) => {
+      const item = raw as Record<string, unknown>
+      const orderIndex = Number(item.order_index ?? 0)
+      const imgW = Number(item.img_w_pt ?? item.w_pt ?? 0)
+      const imgH = Number(item.img_h_pt ?? item.h_pt ?? 0)
+      const yTop = Number(item.y_top_pt ?? 0)
+      const qForReserve = questions.find((qq) => Number(qq.order_index ?? -1) === orderIndex)
+      const badgeReserve = fasikulMode
+        ? fasikulFrameBadgeTopReservePt(
+            qForReserve && typeof qForReserve === 'object'
+              ? (qForReserve as { fasikulFrame?: unknown }).fasikulFrame
+              : undefined,
+          )
+        : 0
+      const section = sectionMetaFromPayloadForOrder(payload, orderIndex, item.section)
+      const sectionReserve = section
+        ? Math.max(0, section.box_h) + Math.max(0, section.gap_after)
+        : 0
+      const topReserve = badgeReserve + sectionReserve
+      const rawImgY = item.img_y_top_pt
+      let imgYTop =
+        rawImgY != null && Number.isFinite(Number(rawImgY))
+          ? Number(rawImgY)
+          : yTop - topReserve
+      if (section && yTop - imgYTop < sectionReserve - 0.5) {
+        imgYTop = yTop - topReserve
+      }
+      const xPt = Number(item.x_pt ?? 0)
+      const fromItem =
+        !emptyOrders.has(orderIndex) &&
+        ((typeof item.image_base64 === 'string' && item.image_base64) ||
+          (typeof item.image_b64 === 'string' && item.image_b64) ||
+          undefined)
+      const hPt = Number(item.h_pt ?? imgH)
+      return {
+        kind: String(item.kind ?? 'question'),
+        order_index: orderIndex,
+        page_num: Number(item.page_num ?? 1),
+        x_pt: xPt,
+        y_top_pt: yTop,
+        w_pt: Number(item.w_pt ?? imgW),
+        h_pt: Math.max(hPt, imgH + topReserve),
+        num_slot_w_pt: Number(item.num_slot_w_pt ?? 0),
+        img_x_pt: Number(item.img_x_pt ?? xPt),
+        img_y_top_pt: imgYTop,
+        img_w_pt: imgW,
+        img_h_pt: imgH,
+        image_base64: emptyOrders.has(orderIndex)
+          ? undefined
+          : fromItem || imgByOrder.get(orderIndex),
+        answer_key: item.answer_key != null ? String(item.answer_key) : undefined,
+        display_number:
+          item.display_number == null || item.display_number === ''
+            ? null
+            : Number(item.display_number),
+        content_type: item.content_type != null ? String(item.content_type) : undefined,
+        question_id: item.question_id != null ? String(item.question_id) : undefined,
+        span_full_width: item.span_full_width === true,
+        layout_mode:
+          item.layout_mode === 'full-width' || item.layout_mode === 'auto'
+            ? item.layout_mode
+            : 'single-column',
+        section,
+      } satisfies LayoutRow
+    })
+  } else {
+    console.debug('[PDF_EXPORT:RENDERER] computeLayoutFromPayload', {
+      exportId,
+      reason: hasSections ? 'sections_require_fresh_layout' : 'no_locked_layout',
+    })
+    ;({ layout } = computeLayoutFromPayload(payload))
+  }
+
+  // Önizleme locked_layout’ta answer_key_page yok; ayrı sayfa stilini PDF’de çizmek için ekle
+  layout = ensureSeparateAnswerKeyPages(layout, payload, page_h_pt) as LayoutRow[]
+
+  const pdf = await PDFDocument.create()
+  const fonts = await loadPdfFonts(pdf)
+
+  const questionPages = layout.filter((l) => l.kind === 'question').map((l) => l.page_num)
+  const answerKeyPages = layout.filter((l) => l.kind === 'answer_key_page').map((l) => l.page_num)
+  const overlays = Array.isArray(payload.optik_form_overlays)
+    ? (payload.optik_form_overlays as Array<Record<string, unknown>>)
+    : []
+  const optikPages = overlays.map((o) => Number(o.page_num ?? 0)).filter((n) => n > 0)
+  const maxPage = Math.max(1, ...questionPages, ...answerKeyPages, ...optikPages)
+
+  const overlaysByPage = new Map<number, Array<Record<string, unknown>>>()
+  for (const o of overlays) {
+    const pn = Number(o.page_num ?? 0)
+    if (pn < 1) continue
+    const list = overlaysByPage.get(pn) ?? []
+    list.push(o)
+    overlaysByPage.set(pn, list)
+  }
+
+  for (let pageNum = 1; pageNum <= maxPage; pageNum += 1) {
+    const page = pdf.addPage([page_w_pt, page_h_pt])
+    const geom = computeGeometry(payload, pageNum)
+    const isAnswerKeyPage = layout.some(
+      (l) => l.kind === 'answer_key_page' && l.page_num === pageNum,
+    )
+    const pageOverlays = overlaysByPage.get(pageNum) ?? []
+    const isOptikOnlyPage =
+      pageOverlays.length > 0 &&
+      !layout.some((l) => l.page_num === pageNum && l.kind !== 'answer_key_page')
+
+    if (isAnswerKeyPage) {
+      drawAnswerKeyPage(page, layout, geom, fonts, payload, pageNum)
+      continue
+    }
+
+    if (!isOptikOnlyPage) {
+      await drawPageHeader(pdf, page, payload, geom, pageNum, fonts, false)
+      const pageItems = layout.filter((l) => l.page_num === pageNum && l.kind === 'question')
+      const qByOrderForSkip = new Map(
+        ((payload.questions as Array<Record<string, unknown>>) ?? []).map((q) => [
+          Number(q.order_index ?? -1),
+          q,
+        ]),
+      )
+      const cellPtApprox = scratchCellPt()
+      const sorted = [...pageItems].sort(
+        (a, b) => Number(b.y_top_pt ?? 0) - Number(a.y_top_pt ?? 0),
+      )
+      const skipBands: Array<{ yBottom: number; yTop: number }> = []
+      const colWForSkip = Number(geom.colW ?? 0)
+      for (let i = 0; i < sorted.length; i += 1) {
+        const l = sorted[i]!
+        const q = qByOrderForSkip.get(l.order_index)
+        const qMode = String(q?.layoutMode ?? q?.layout_mode ?? '')
+        const wPt = Number(l.w_pt ?? 0)
+        const imgWPt = Number(l.img_w_pt ?? 0)
+        const isFw =
+          l.span_full_width === true ||
+          l.layout_mode === 'full-width' ||
+          qMode === 'full-width' ||
+          (colWForSkip > 0 && (wPt > colWForSkip * 1.35 || imgWPt > colWForSkip * 1.35))
+        if (!isFw) continue
+        const yTop = Number(l.y_top_pt ?? l.img_y_top_pt ?? 0)
+        const h = Number(l.h_pt ?? l.img_h_pt ?? 0)
+        const imgY = Number(l.img_y_top_pt ?? yTop)
+        const imgH = Number(l.img_h_pt ?? h)
+        const visualBottom = imgY - imgH
+        let yBottom = yTop - h
+        if (fasikulFrameShowsScratchGrid(q?.fasikulFrame)) {
+          const rowsRaw = Number(q?.scratchGridRows)
+          yBottom = Math.min(
+            yBottom,
+            visualBottom -
+              scratchOccupiedHeightPt(
+                resolveEffectiveScratchGridRows(
+                  Number.isFinite(rowsRaw) ? rowsRaw : null,
+                ),
+                cellPtApprox,
+              ),
+          )
+        }
+        // Kareli alan sonraki soruya kadar uzar — çizgiyi tüm aralıkta kes
+        const next = sorted[i + 1]
+        if (next?.y_top_pt != null) {
+          yBottom = Math.min(yBottom, Number(next.y_top_pt))
+        } else {
+          yBottom = Math.min(yBottom, Number(geom.contentBottom ?? yBottom))
+        }
+        skipBands.push({ yBottom, yTop })
+      }
+      drawColumnDividers(page, payload, geom, pageNum, false, skipBands)
+
+      await drawQuestionsOnPage(
+        pdf,
+        page,
+        pageItems,
+        fonts,
+        payload,
+        layoutCtx,
+        pdfLogRows,
+        counters,
+        exportId,
+        usedLockedLayoutPositions,
+      )
+
+      drawCenterLineText(page, payload, geom, pageNum, fonts, false, skipBands)
+      drawFooter(page, payload, geom, pageNum, pageItems, fonts, maxPage)
+    } else {
+      drawFooter(page, payload, geom, pageNum, [], fonts, maxPage)
+    }
+
+    for (const o of pageOverlays) {
+      const b64 = String(o.image_png_base64 ?? '')
+      if (!b64) continue
+      try {
+        const image = await embedQuestionImage(pdf, b64)
+        page.drawImage(image, {
+          x: Number(o.x_pt ?? 0),
+          y: Number(o.y_pt ?? 0),
+          width: Number(o.w_pt ?? 0),
+          height: Number(o.h_pt ?? 0),
+        })
+      } catch {
+        /* optik overlay gömülemedi */
+      }
+    }
+
+    await drawWatermark(pdf, page, payload, geom, fonts)
+    drawPageFrame(page, payload, geom)
+  }
+
+  logPipelineDrawTable(pdfLogRows, {
+    equalizeRunId:
+      typeof payload.equalize_run_id === 'string' ? payload.equalize_run_id : null,
+  })
+  const previewMetrics = payload.preview_draw_metrics as
+    | Array<{ questionNo: number; appliedScale: number; drawWidth: number; drawHeight: number }>
+    | undefined
+  comparePreviewAndPdfExport(Array.isArray(previewMetrics) ? previewMetrics : [], pdfLogRows)
+
+  const bytes = await pdf.save()
+  const equalizeRunId =
+    typeof payload.equalize_run_id === 'string' ? payload.equalize_run_id : null
+  const diagnostics: PdfExportDiagnostics = {
+    exportId,
+    renderedQuestionCount: counters.renderedQuestionCount,
+    pdfExportDiagnosticsCount: pdfLogRows.length,
+    usedSharedMetricsCount: counters.usedSharedMetricsCount,
+    usedLockedLayoutCount: counters.usedLockedLayoutCount,
+    usedLockedLayoutPositions,
+    drawImageLogCount: counters.drawImageLogCount,
+    questions: pdfLogRows.map((r) => ({
+      questionNo: r.questionNo,
+      requestedScale: r.requestedScale,
+      appliedScale: r.appliedScale,
+      drawWidth: r.drawWidth,
+      drawHeight: r.drawHeight,
+      normalizationScale: r.normalizationScale,
+      manualScale: r.manualScale,
+      metadataSource: r.metadataSource,
+    })),
+    rendererFile: 'electron/services/pdf-export-renderer.ts#exportPdfFromPayload',
+  }
+  console.debug('[PDF_EXPORT:RENDERER] done', {
+    exportId,
+    equalizeRunId,
+    stage: 'PDF_EXPORT',
+    renderedQuestionCount: diagnostics.renderedQuestionCount,
+    pdfExportDiagnosticsCount: diagnostics.pdfExportDiagnosticsCount,
+    usedSharedMetricsCount: diagnostics.usedSharedMetricsCount,
+    usedLockedLayoutCount: diagnostics.usedLockedLayoutCount,
+    drawImageLogCount: diagnostics.drawImageLogCount,
+  })
+  return { bytes, diagnostics }
+}

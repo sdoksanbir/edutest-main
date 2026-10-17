@@ -1,0 +1,300 @@
+/* --- Siyah çapraz imleç (PDF üzerinde net görünsün) --- */
+.crop-workspace .ReactCrop {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath stroke='%23fff' stroke-width='3' stroke-linecap='square' d='M12 1v22M1 12h22'/%3E%3Cpath stroke='%23000' stroke-width='1.5' stroke-linecap='square' d='M12 1v22M1 12h22'/%3E%3C/svg%3E")
+      12 12,
+    crosshair !important;
+}
+
+/* --- ReactCrop: kırmızı seçim (karartma seçim bitince; sürüklerken gölge yok) --- */
+.crop-workspace .ReactCrop__crop-selection {
+  border: 2px solid #dc2626 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  /* Varsayılan beyaz marching-ants'i kapat */
+  background-image: none !important;
+  animation: none !important;
+}
+
+.crop-workspace--dimmed .ReactCrop__crop-selection {
+  /* 9999px yerine viewport tabanlı — aynı görünüm, daha az aşırı raster */
+  box-shadow: 0 0 0 100vmax rgb(15 23 42 / 0.52) !important;
+  /* İlk karartmada ayrı katmana al; sürükleme sırasında yeniden boyamayı azalt */
+  transform: translateZ(0);
+  will-change: box-shadow;
+}
+
+.crop-workspace .ReactCrop__drag-handle {
+  width: 8px !important;
+  height: 8px !important;
+  background: #dc2626 !important;
+  border: 1px solid #fff !important;
+  border-radius: 1px !important;
+}
+
+.crop-workspace .ReactCrop__drag-bar {
+  background: transparent !important;
+}
+
+.crop-workspace .ReactCrop__drag-handle.ord-n,
+.crop-workspace .ReactCrop__drag-handle.ord-s,
+.crop-workspace .ReactCrop__drag-handle.ord-e,
+.crop-workspace .ReactCrop__drag-handle.ord-w {
+  background: #dc2626 !important;
+}
+
+/* --- Cevabı işaretle paneli --- */
+.tq-answer-mark {
+  width: fit-content;
+  max-width: calc(100vw - 2rem);
+  border-radius: 0.625rem;
+  border: 1px solid rgb(226 232 240);
+  background: #fff;
+  color: rgb(30 41 59);
+  box-shadow:
+    0 16px 40px rgb(15 23 42 / 0.18),
+    0 4px 12px rgb(15 23 42 / 0.1);
+  padding: 0.4375rem 0.5rem 0.5rem;
+}
+
+.tq-answer-mark__row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.3125rem;
+}
+
+.tq-answer-mark__choices {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.tq-answer-mark__choice {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 1px solid rgb(203 213 225);
+  border-radius: 0.375rem;
+  background: #fff;
+  color: rgb(51 65 85);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.tq-answer-mark__choice:hover {
+  border-color: rgb(148 163 184);
+  background: rgb(248 250 252);
+}
+
+.tq-answer-mark__choice--active {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #fff;
+}
+
+.tq-answer-mark__layout {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.25rem;
+  padding-left: 0.375rem;
+  border-left: 1px solid rgb(226 232 240);
+}
+
+.tq-answer-mark__actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.3125rem;
+  margin-top: 0.375rem;
+  padding-top: 0.375rem;
+  border-top: 1px solid rgb(241 245 249);
+}
+
+.tq-answer-mark__layout-btn {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1875rem;
+  height: 1.75rem;
+  padding: 0 0.375rem;
+  border: 1px solid rgb(203 213 225);
+  border-radius: 0.375rem;
+  background: #fff;
+  color: rgb(51 65 85);
+  font: inherit;
+  font-size: 0.625rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+
+.tq-answer-mark__layout-btn:hover {
+  border-color: rgb(148 163 184);
+}
+
+.tq-answer-mark__layout-btn--active {
+  border-color: rgb(15 23 42);
+  background: rgb(248 250 252);
+  box-shadow: inset 0 0 0 1px rgb(15 23 42);
+}
+
+.tq-answer-mark__cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.75rem;
+  padding: 0 0.5rem;
+  border: 1px solid rgb(203 213 225);
+  border-radius: 0.375rem;
+  background: #fff;
+  color: rgb(51 65 85);
+  font: inherit;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tq-answer-mark__cancel:hover {
+  background: rgb(248 250 252);
+}
+
+.tq-answer-mark__confirm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.75rem;
+  padding: 0 0.5625rem;
+  border: none;
+  border-radius: 0.375rem;
+  background: #c2410c;
+  color: #fff;
+  font: inherit;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tq-answer-mark__confirm:hover {
+  background: #9a3412;
+}
+
+.tq-answer-mark__confirm:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Çerçeve dışı sol üst soru numarası */
+.tq-crop-number-badge {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  margin-bottom: 4px;
+  z-index: 25;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 4.25rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  color: #fff;
+  background: #dc2626;
+  box-shadow: 0 2px 6px rgb(15 23 42 / 0.25);
+}
+
+/* Çerçeve dışı sol alt cevap rozeti */
+.tq-crop-answer-badge {
+  position: absolute;
+  left: 0;
+  top: 100%;
+  margin-top: 4px;
+  z-index: 25;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  min-width: 4.5rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.25rem;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.2;
+  white-space: nowrap;
+  color: #fff;
+  box-shadow: 0 2px 6px rgb(15 23 42 / 0.25);
+}
+
+.tq-crop-answer-badge--filled {
+  background: #16a34a;
+}
+
+.tq-crop-answer-badge--empty {
+  background: #dc2626;
+}
+
+/* Kayıtlı seçim kutusu — cevap yok: kırmızı, cevap var: yeşil */
+.tq-crop-selection-box {
+  border: 2px solid #dc2626;
+  box-sizing: border-box;
+  border-radius: 1px;
+  background: rgb(220 38 38 / 0.08);
+}
+
+.tq-crop-selection-box--has-answer {
+  border-color: #16a34a;
+  background: rgb(22 163 74 / 0.1);
+}
+
+.tq-crop-selection-box--no-answer {
+  border-color: #dc2626;
+  background: rgb(220 38 38 / 0.08);
+}
+
+/* Ana editöre eklenmiş (eski sınıf — cevap rozeti öncelikli) */
+.tq-crop-selection-box--in-editor:not(.tq-crop-selection-box--no-answer) {
+  border-color: #16a34a;
+}
+
+.tq-crop-selection-box--editing {
+  border-width: 2px;
+  box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.35);
+}
+
+.tq-crop-selection-box--editing.tq-crop-selection-box--has-answer {
+  box-shadow: 0 0 0 1px rgba(22, 163, 74, 0.35);
+}
+
+.tq-crop-resize-handle {
+  position: absolute;
+  z-index: 25;
+  width: 10px;
+  height: 10px;
+  box-sizing: border-box;
+  border: 2px solid #dc2626;
+  background: #f8fafc;
+  border-radius: 2px;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.tq-crop-selection-box--in-editor .tq-crop-resize-handle {
+  border-color: #16a34a;
+}

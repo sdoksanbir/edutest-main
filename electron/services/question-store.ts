@@ -1,0 +1,190 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { imagesDir } from './paths.js'
+
+export type CropBox = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export type QuestionItem = {
+  id: string
+  pdf_id: string
+  page_number: number
+  crop: CropBox
+  answer_key: string
+  order_index: number
+  content_type: 'question' | 'explanation'
+  remove_background: boolean
+  image_path?: string
+  image_base64?: string
+  display_scale?: number
+  custom_gap_mm?: number
+  [key: string]: unknown
+}
+
+const questions: QuestionItem[] = []
+
+function saveImageFromBase64(imageBase64: string): string {
+  fs.mkdirSync(imagesDir(), { recursive: true })
+  const raw = imageBase64.includes(',') ? imageBase64.split(',')[1]! : imageBase64
+  const id = randomUUID()
+  const filePath = path.join(imagesDir(), `${id}.png`)
+  fs.writeFileSync(filePath, Buffer.from(raw, 'base64'))
+  return filePath
+}
+
+export function listQuestions() {
+  return [...questions]
+}
+
+export function createFromPdf(payload: {
+  pdf_id: string
+  page_number: number
+  crop: CropBox
+  answer_key: string
+  image_base64?: string
+}): QuestionItem {
+  const item: QuestionItem = {
+    id: randomUUID(),
+    pdf_id: payload.pdf_id,
+    page_number: payload.page_number,
+    crop: payload.crop,
+    answer_key: payload.answer_key,
+    order_index: questions.length,
+    content_type: 'question',
+    remove_background: false,
+    image_path: payload.image_base64 ? saveImageFromBase64(payload.image_base64) : undefined,
+  }
+  questions.push(item)
+  return item
+}
+
+export function createFromLocalPdf(payload: {
+  page_number: number
+  crop: CropBox
+  answer_key: string
+  image_base64: string
+}): QuestionItem {
+  const item: QuestionItem = {
+    id: randomUUID(),
+    pdf_id: '',
+    page_number: payload.page_number,
+    crop: payload.crop,
+    answer_key: payload.answer_key,
+    order_index: questions.length,
+    content_type: 'question',
+    remove_background: false,
+    image_path: saveImageFromBase64(payload.image_base64),
+  }
+  questions.push(item)
+  return item
+}
+
+function find(id: string) {
+  const q = questions.find((x) => x.id === id)
+  if (!q) throw new Error('Question not found')
+  return q
+}
+
+function findOptional(id: string): QuestionItem | undefined {
+  return questions.find((x) => x.id === id)
+}
+
+export function getImageBase64(id: string): string {
+  const q = findOptional(id)
+  if (!q) {
+    // İstemci-only boş fasikül kutuları store’da yok — hata fırlatma
+    return ''
+  }
+  if (q.image_path && fs.existsSync(q.image_path)) {
+    return fs.readFileSync(q.image_path).toString('base64')
+  }
+  if (q.image_base64) {
+    return q.image_base64.includes(',') ? q.image_base64.split(',')[1]! : q.image_base64
+  }
+  return ''
+}
+
+export function updateAnswer(id: string, answer_key: string) {
+  find(id).answer_key = answer_key
+  return find(id)
+}
+
+export function updateCrop(id: string, crop: CropBox) {
+  find(id).crop = crop
+  return find(id)
+}
+
+export function updateContentType(id: string, content_type: 'question' | 'explanation') {
+  find(id).content_type = content_type
+  return find(id)
+}
+
+export function updateRemoveBackground(id: string, remove_background: boolean) {
+  find(id).remove_background = remove_background
+  return find(id)
+}
+
+export function updateExplanationCaption(id: string, body: Record<string, unknown>) {
+  const q = find(id)
+  Object.assign(q, body)
+  return q
+}
+
+export function reorder(ordered_ids: string[]) {
+  const byId = Object.fromEntries(questions.map((q) => [q.id, q]))
+  // İstemci-only boş fasikül kutuları store’da olmayabilir — atla
+  const next = ordered_ids
+    .map((id, index) => {
+      const q = byId[id]
+      if (!q) return null
+      return { ...q, order_index: index }
+    })
+    .filter((q): q is QuestionItem => q != null)
+  // Eksik id’ler atlandıysa order_index’i yeniden sıkıştır
+  next.forEach((q, i) => {
+    q.order_index = i
+  })
+  questions.splice(0, questions.length, ...next)
+  return listQuestions()
+}
+
+export function remove(id: string) {
+  const idx = questions.findIndex((q) => q.id === id)
+  if (idx < 0) return
+  questions.splice(idx, 1)
+}
+
+/**
+ * Taslak / geri yükleme: base64’i diske yazar, image_path günceller.
+ * Böylece sayfa/özellik değişince getImage diskten güvenilir okunur;
+ * bellek + IPC şişmesi azalır.
+ */
+export function replaceAll(items: QuestionItem[]) {
+  const next = items.map((item) => {
+    const copy: QuestionItem = { ...item }
+    if (typeof copy.image_base64 === 'string' && copy.image_base64.length > 32) {
+      try {
+        copy.image_path = saveImageFromBase64(copy.image_base64)
+      } catch {
+        /* mevcut image_path varsa koru */
+      }
+      delete copy.image_base64
+    } else if (typeof copy.image_path === 'string' && copy.image_path) {
+      if (!fs.existsSync(copy.image_path)) {
+        const candidate = path.join(imagesDir(), path.basename(copy.image_path))
+        if (fs.existsSync(candidate)) copy.image_path = candidate
+      }
+    }
+    return copy
+  })
+  questions.splice(0, questions.length, ...next)
+}
+
+export function clearAll() {
+  questions.splice(0, questions.length)
+}

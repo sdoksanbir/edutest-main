@@ -1,0 +1,169 @@
+import type { LayoutItem } from "../api/client";
+import {
+  FOOTER_TOP_OFFSET_MM,
+  isLayoutItemFullWidth,
+  mmToPdfPt,
+  computePageColumnBand,
+  type LayoutGeometryInput,
+} from "./pdfLayoutGeometry";
+import type { QuestionDragLive } from "./questionVerticalDrag";
+
+const PT_PER_INCH = 72;
+const PT_TO_MM = 25.4 / PT_PER_INCH;
+
+export type QuestionGapIndicator = {
+  lineXPx: number;
+  yTopPx: number;
+  yBottomPx: number;
+  gapMm: number;
+};
+
+function ptToCanvasY(pageHpt: number, yTopPt: number, scale: number): number {
+  return (pageHpt - yTopPt) * scale;
+}
+
+function itemImgYTopPt(
+  item: LayoutItem,
+  dragLive?: QuestionDragLive | null,
+  yShiftPt = 0,
+): number | null {
+  if (dragLive?.orderIndex === item.order_index) return dragLive.imgYTopPt;
+  const base = item.img_y_top_pt ?? null;
+  return base == null ? null : base + yShiftPt;
+}
+
+/** Blok üstü = ÖRNEK badge üst kenarı (img_y_top + badge rezervi). */
+function itemBlockYTopPt(
+  item: LayoutItem,
+  dragLive?: QuestionDragLive | null,
+  yShiftPt = 0,
+): number | null {
+  const imgTop = itemImgYTopPt(item, dragLive, yShiftPt);
+  if (imgTop == null) return null;
+  const reserve = Math.max(
+    0,
+    (item.y_top_pt ?? item.img_y_top_pt ?? 0) - (item.img_y_top_pt ?? 0),
+  );
+  if (dragLive?.orderIndex === item.order_index) {
+    return dragLive.imgYTopPt + reserve;
+  }
+  return (item.y_top_pt ?? item.img_y_top_pt ?? 0) + yShiftPt;
+}
+
+export function computeQuestionGapIndicators(input: {
+  layout: LayoutItem[];
+  pageNum: number;
+  pageWpt: number;
+  pageHpt: number;
+  scale: number;
+  marginBottomMm: number;
+  questionNumberLeftOffsetMm: number;
+  dragLive?: QuestionDragLive | null;
+  yShiftPtForItem?: (item: LayoutItem) => number;
+  /**
+   * Fasikül: üst soru görsel altı ↔ sonraki ÖRNEK üstü;
+   * çizgi bu aralıkta, soru görseli yatay ortasında.
+   */
+  fasikulGapMode?: boolean;
+  /** Soru order_index → layoutMode (geniş soruda ortadaki mm çizgisini gizle) */
+  layoutModeByOrder?: Map<number, string | null | undefined>;
+  geometry?: LayoutGeometryInput;
+}): QuestionGapIndicator[] {
+  const {
+    layout,
+    pageNum,
+    pageWpt,
+    pageHpt,
+    scale,
+    marginBottomMm,
+    questionNumberLeftOffsetMm,
+    dragLive,
+    yShiftPtForItem,
+    fasikulGapMode = false,
+    layoutModeByOrder,
+    geometry,
+  } = input;
+
+  const pageItems = layout.filter((l) => l.page_num === pageNum && l.kind !== "answer_key_page");
+  if (pageItems.length === 0) return [];
+
+  const midX = pageWpt / 2;
+  const xOffsetPt = mmToPdfPt(questionNumberLeftOffsetMm);
+  const footerTopPt = mmToPdfPt(marginBottomMm) + mmToPdfPt(FOOTER_TOP_OFFSET_MM);
+  const indicators: QuestionGapIndicator[] = [];
+  const colWidthPt = geometry
+    ? computePageColumnBand({ ...geometry, pageNum }).colWidthPt
+    : undefined;
+
+  pageItems.forEach((item) => {
+    // Geniş + fasikül: kareli alanın ortasından mm/çizgi geçmesin
+    if (
+      fasikulGapMode &&
+      isLayoutItemFullWidth(item, {
+        questionLayoutMode: layoutModeByOrder?.get(item.order_index),
+        colWidthPt,
+      })
+    ) {
+      return;
+    }
+
+    const yShiftPt = yShiftPtForItem?.(item) ?? 0;
+    const imgYTop = itemImgYTopPt(item, dragLive, yShiftPt);
+    const hasImg =
+      item.img_x_pt != null &&
+      imgYTop != null &&
+      item.img_w_pt != null &&
+      item.img_h_pt != null;
+    if (!hasImg) return;
+
+    const currBottomPt = imgYTop - (item.img_h_pt ?? 0);
+    const isLeft = (item.img_x_pt ?? 0) < midX;
+    const fullWidth = isLayoutItemFullWidth(item, {
+      questionLayoutMode: layoutModeByOrder?.get(item.order_index),
+      colWidthPt,
+    });
+    const below = pageItems.filter((l) => {
+      const belowY = itemImgYTopPt(l, dragLive, yShiftPtForItem?.(l) ?? 0);
+      return (
+        l.img_x_pt != null &&
+        belowY != null &&
+        (fullWidth || ((l.img_x_pt ?? 0) < midX) === isLeft) &&
+        belowY < imgYTop
+      );
+    });
+    const next = below.sort(
+      (a, b) =>
+        (itemImgYTopPt(b, dragLive, yShiftPtForItem?.(b) ?? 0) ?? 0) -
+        (itemImgYTopPt(a, dragLive, yShiftPtForItem?.(a) ?? 0) ?? 0),
+    )[0];
+
+    let yBottomPt: number;
+    if (next) {
+      const nextShift = yShiftPtForItem?.(next) ?? 0;
+      yBottomPt = fasikulGapMode
+        ? (itemBlockYTopPt(next, dragLive, nextShift) ?? footerTopPt)
+        : (itemImgYTopPt(next, dragLive, nextShift) ?? footerTopPt);
+    } else {
+      yBottomPt = footerTopPt;
+    }
+
+    const gapPt = currBottomPt - yBottomPt;
+    if (gapPt <= 0) return;
+
+    const gapMm = Math.round(gapPt * PT_TO_MM * 10) / 10;
+
+    // Fasikül: çizgiyi soru görselinin yatay ortasına koy (ÖRNEK–görsel aralığında okunaklı)
+    const lineXPx = fasikulGapMode
+      ? ((item.img_x_pt ?? 0) + (item.img_w_pt ?? 0) / 2) * scale
+      : ((item.x_pt ?? 0) + xOffsetPt + (item.w_pt ?? 0) / 2) * scale;
+
+    indicators.push({
+      lineXPx,
+      yTopPx: ptToCanvasY(pageHpt, currBottomPt, scale),
+      yBottomPx: ptToCanvasY(pageHpt, yBottomPt, scale),
+      gapMm,
+    });
+  });
+
+  return indicators;
+}
